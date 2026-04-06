@@ -12,9 +12,9 @@ from datetime import datetime, date
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.generativeai as genai
-from google.api_core import exceptions as google_exceptions
-from PIL import Image
+
+# google-generativeai / PIL are imported lazily so /health works on Vercel and cold
+# starts do not fail if those stacks misbehave during import.
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -23,26 +23,37 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("licence-validator")
 
 # ---------------------------------------------------------------------------
-# Gemini configuration
+# Gemini configuration (lazy init — supports Vercel build & cold start without import-time env)
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY environment variable is not set")
-
-genai.configure(api_key=GEMINI_API_KEY)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-model = genai.GenerativeModel(GEMINI_MODEL)
+_gemini_model = None
+
+
+def _get_gemini_model():
+    global _gemini_model
+    if _gemini_model is None:
+        import google.generativeai as genai
+
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="GEMINI_API_KEY is not configured on the server",
+            )
+        genai.configure(api_key=api_key)
+        _gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+    return _gemini_model
 
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
-app = FastAPI(
+fastapi_app = FastAPI(
     title="Driving Licence Validator",
     description="Validates driving licences using Gemini AI – checks 2+ years of experience",
     version="1.0.0",
 )
 
-app.add_middleware(
+fastapi_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
@@ -69,6 +80,7 @@ class HealthResponse(BaseModel):
     status: str
     service: str
     timestamp: str
+    gemini_configured: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +122,9 @@ Respond ONLY with the following JSON (no markdown fences, no extra text):
 # ---------------------------------------------------------------------------
 async def analyse_licence(image_bytes: bytes, content_type: str) -> dict:
     """Send the licence image to Gemini and parse the structured response."""
+    from google.api_core import exceptions as google_exceptions
+    from PIL import Image
+
     try:
         image = Image.open(io.BytesIO(image_bytes))
     except Exception:
@@ -120,7 +135,7 @@ async def analyse_licence(image_bytes: bytes, content_type: str) -> dict:
 
     logger.info("Sending image to Gemini for analysis …")
     try:
-        response = model.generate_content([prompt, image])
+        response = _get_gemini_model().generate_content([prompt, image])
     except google_exceptions.ResourceExhausted as e:
         logger.warning("Gemini quota exceeded: %s", e)
         raise HTTPException(
@@ -165,17 +180,18 @@ async def analyse_licence(image_bytes: bytes, content_type: str) -> dict:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
-@app.get("/health", response_model=HealthResponse)
+@fastapi_app.get("/health", response_model=HealthResponse)
 async def health():
     """Health-check endpoint – useful for Docker / orchestrators."""
     return HealthResponse(
         status="healthy",
         service="driving-licence-validator",
         timestamp=datetime.utcnow().isoformat(),
+        gemini_configured=bool(os.getenv("GEMINI_API_KEY")),
     )
 
 
-@app.post("/validate", response_model=ValidationResult)
+@fastapi_app.post("/validate", response_model=ValidationResult)
 async def validate_licence(file: UploadFile = File(...)):
     """
     Upload a driving licence image.
@@ -208,7 +224,7 @@ async def validate_licence(file: UploadFile = File(...)):
     return ValidationResult(**result)
 
 
-@app.post("/validate-base64", response_model=ValidationResult)
+@fastapi_app.post("/validate-base64", response_model=ValidationResult)
 async def validate_licence_base64(payload: dict):
     """
     Alternative endpoint – accepts a base64-encoded image in JSON body.
