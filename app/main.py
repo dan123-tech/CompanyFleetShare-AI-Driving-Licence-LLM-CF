@@ -498,12 +498,32 @@ async def validate_licence(file: UploadFile = File(...)):
     return ValidationResult(**result)
 
 
+@fastapi_app.post("/validate-license", response_model=ValidationResult)
+@fastapi_app.post("/api/validate", response_model=ValidationResult)
+@fastapi_app.post("/api/verify", response_model=ValidationResult)
+async def validate_licence_alias(file: UploadFile = File(...)):
+    """
+    Compatibility aliases used by older clients/deployments.
+    """
+    return await validate_licence(file)
+
+
 @fastapi_app.get("/validate")
 async def validate_licence_help():
     """Friendly help for browser visits to /validate."""
     return {
         "message": "Use POST /validate with multipart form-data field 'file'.",
         "example_curl": "curl -X POST https://<your-domain>/validate -F \"file=@/path/to/licence.jpg\"",
+        "swagger_docs": "/docs",
+    }
+
+
+@fastapi_app.get("/verify")
+async def verify_licence_help():
+    """Friendly help for browser visits to /verify."""
+    return {
+        "message": "Use POST /verify with multipart form-data field 'file'.",
+        "example_curl": "curl -X POST https://<your-domain>/verify -F \"file=@/path/to/licence.jpg\"",
         "swagger_docs": "/docs",
     }
 
@@ -536,3 +556,11 @@ async def validate_licence_base64(payload: dict):
 
     result = await analyse_licence(image_bytes, content_type)
     return ValidationResult(**result)
+
+
+@fastapi_app.post("/verify", response_model=ValidationResult)
+async def verify_licence(file: UploadFile = File(...)):
+    """
+    Alias of /validate for clients expecting /verify.
+    """
+    return await validate_licence(file)
