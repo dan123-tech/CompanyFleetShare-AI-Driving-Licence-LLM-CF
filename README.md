@@ -1,6 +1,6 @@
-# Driving Licence Validator – Gemini AI
+# Driving Licence Validator – Cloudflare Workers AI
 
-A Dockerised microservice that uses **Google Gemini AI** to analyse driving licence images and determine whether the holder has **2+ years of driving experience**.
+A Dockerised microservice that uses **Cloudflare Workers AI** to analyse driving licence images and determine whether the holder has **2+ years of driving experience**.
 
 ---
 
@@ -17,6 +17,14 @@ A Dockerised microservice that uses **Google Gemini AI** to analyse driving lice
 ```
 
 ## Quick Start
+
+### 0. Configure environment variables
+
+Copy `.env.example` to `.env` and fill your Cloudflare values:
+
+```bash
+cp .env.example .env
+```
 
 ### 1. Build & Run with Docker Compose
 
@@ -37,6 +45,12 @@ curl http://localhost:8080/health
 ```bash
 curl -X POST http://localhost:8080/validate \
   -F "file=@/path/to/driving_licence.jpg"
+```
+
+### 5. Smoke test from PowerShell (Windows)
+
+```powershell
+.\scripts\smoke-test.ps1 -ImagePath "C:\path\to\driving_licence.jpg"
 ```
 
 ### 4. Validate via base64 (container-to-container)
@@ -91,12 +105,14 @@ Both containers share the `validator-net` bridge network, so they can reach each
 
 | Variable         | Description              |
 |------------------|--------------------------|
-| `GEMINI_API_KEY` | Google Gemini API key    |
+| `CF_ACCOUNT_ID`  | Cloudflare account id (Workers AI) |
+| `CF_API_TOKEN`   | Cloudflare API token with Workers AI permissions |
+| `CF_AI_MODEL`    | Workers AI model name (default: `@cf/llava-hf/llava-1.5-7b-hf`) |
 
 ## Project Structure
 
 ```
-AI_gemini/
+AI_cloudflare/
 ├── app/
 │   ├── __init__.py
 │   └── main.py              # FastAPI application

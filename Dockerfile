@@ -1,4 +1,4 @@
-# ── Driving Licence Validator – Gemini AI Service ──
+# ── Driving Licence Validator – Cloudflare Workers AI Service ──
 FROM python:3.12-slim
 
 # Prevent Python from writing .pyc files & enable unbuffered stdout/stderr
@@ -6,6 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
+
+# Install OCR engine (Tesseract)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies first (better Docker layer caching)
 COPY requirements.txt .

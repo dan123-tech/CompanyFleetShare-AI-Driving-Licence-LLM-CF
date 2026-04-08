@@ -1,6 +1,6 @@
 """
-Gemini AI - Driving Licence Validator Service
-Receives a driving licence image, analyses it with Google Gemini,
+Cloudflare AI - Driving Licence Validator Service
+Receives a driving licence image, analyses it with Cloudflare Workers AI,
 and returns whether the driver has 2+ years of experience.
 """
 
@@ -13,8 +13,8 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# google-generativeai / PIL are imported lazily so /health works on Vercel and cold
-# starts do not fail if those stacks misbehave during import.
+# Third-party libs are imported lazily so /health works on Vercel and cold starts
+# do not fail if optional stacks misbehave during import.
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -23,33 +23,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("licence-validator")
 
 # ---------------------------------------------------------------------------
-# Gemini configuration (lazy init — supports Vercel build & cold start without import-time env)
+# Cloudflare Workers AI configuration
 # ---------------------------------------------------------------------------
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-_gemini_model = None
+# Default model is vision-capable (image + prompt). You can override via env.
+CF_AI_MODEL = os.getenv("CF_AI_MODEL", "@cf/llava-hf/llava-1.5-7b-hf")
 
 
-def _get_gemini_model():
-    global _gemini_model
-    if _gemini_model is None:
-        import google.generativeai as genai
+def _cloudflare_configured() -> bool:
+    return bool(os.getenv("CF_ACCOUNT_ID")) and bool(os.getenv("CF_API_TOKEN"))
 
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise HTTPException(
-                status_code=503,
-                detail="GEMINI_API_KEY is not configured on the server",
-            )
-        genai.configure(api_key=api_key)
-        _gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-    return _gemini_model
+
+def _cloudflare_ai_url() -> str:
+    account_id = os.getenv("CF_ACCOUNT_ID")
+    if not account_id:
+        raise HTTPException(status_code=503, detail="CF_ACCOUNT_ID is not configured on the server")
+    return f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{CF_AI_MODEL}"
 
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 fastapi_app = FastAPI(
     title="Driving Licence Validator",
-    description="Validates driving licences using Gemini AI – checks 2+ years of experience",
+    description="Validates driving licences using Cloudflare Workers AI – checks 2+ years of experience",
     version="1.0.0",
 )
 
@@ -67,6 +62,10 @@ fastapi_app.add_middleware(
 class ValidationResult(BaseModel):
     approved: bool
     years_of_experience: float | None = None
+    family_name: str | None = None
+    given_name: str | None = None
+    birth_date: str | None = None
+    birth_place: str | None = None
     issue_date: str | None = None
     expiry_date: str | None = None
     licence_number: str | None = None
@@ -80,22 +79,24 @@ class HealthResponse(BaseModel):
     status: str
     service: str
     timestamp: str
-    gemini_configured: bool = False
+    cloudflare_configured: bool = False
 
 
 # ---------------------------------------------------------------------------
-# Prompt sent to Gemini
+# Prompt sent to the model
 # ---------------------------------------------------------------------------
 VALIDATION_PROMPT = """You are an expert driving licence document analyst.
 
-Analyse the driving licence image provided and extract the following information:
+Analyse the driving licence image provided and extract the standard EU-style fields:
 
-1. **Holder name** – full name on the licence
-2. **Licence number** – the unique licence identifier
-3. **Issue date** – date the licence was first issued (dd/mm/yyyy)
-4. **Expiry date** – date the licence expires (dd/mm/yyyy)
-5. **Licence categories** – vehicle categories the holder is allowed to drive
-6. **Years of driving experience** – calculate from the issue date to today ({today}).
+- **Field 1**: family name
+- **Field 2**: given name
+- **Field 3**: date and place of birth (split into birth_date and birth_place)
+- **Field 4a**: issue date (licence emitted date)
+- **Field 4b**: expiry date
+- **Field 9**: categories allowed to drive
+- **Licence number**: unique licence identifier
+- **Years of driving experience** – calculate from field 4a to today ({today}).
    If the issue date is not clearly visible, estimate from any available dates.
 
 Then decide:
@@ -103,26 +104,199 @@ Then decide:
 - **REJECTED** if the holder has **less than 2 years** of driving experience.
 - If the image is **not a driving licence**, respond with REJECTED and explain.
 
+Rules:
+- Do not guess. If a field is not clearly readable, set it to null.
+- Dates must be exactly dd/mm/yyyy or null.
+- Keep strings short (max 64 chars); never output long repeated text.
+- Output MUST be valid JSON (double quotes), with ONLY the keys below.
+- You may receive an OCR_TEXT block. Prefer OCR_TEXT over guessing from the image.
+- Only output a field if it is supported by OCR_TEXT or is clearly visible.
+
 Respond ONLY with the following JSON (no markdown fences, no extra text):
 {{
   "approved": true or false,
   "years_of_experience": <number or null>,
+  "family_name": "<string or null>",
+  "given_name": "<string or null>",
+  "birth_date": "<dd/mm/yyyy or null>",
+  "birth_place": "<string or null>",
   "issue_date": "<dd/mm/yyyy or null>",
   "expiry_date": "<dd/mm/yyyy or null>",
   "licence_number": "<string or null>",
-  "holder_name": "<string or null>",
   "licence_categories": "<string or null>",
   "reason": "<brief explanation>"
 }}
+Keep text fields concise. Do not output excessively long strings.
 """
+
+
+def _parse_ddmmyyyy(value: str | None) -> date | None:
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip()
+    # Accept common separators produced by OCR/LLMs, normalize to dd/mm/yyyy.
+    for sep in (".", "-", " "):
+        raw = raw.replace(sep, "/")
+    raw = "/".join([p for p in raw.split("/") if p])
+    try:
+        return datetime.strptime(raw, "%d/%m/%Y").date()
+    except Exception:
+        return None
+
+
+def _cap_str(value: str | None, max_len: int = 64) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    value = value.strip()
+    if not value:
+        return None
+    return value[:max_len]
+
+
+def _normalize_categories(raw: str | None) -> str | None:
+    """
+    Keep only known driving licence categories and discard issuer text/noise.
+    """
+    if not raw:
+        return None
+    if not isinstance(raw, str):
+        raw = str(raw)
+
+    allowed = {"AM", "A1", "A2", "A", "B1", "B", "BE", "C1", "C", "CE", "D1", "D", "DE"}
+
+    # Normalize separators and tokenize.
+    up = raw.upper()
+    for sep in (";", "|", "/", "\\", "-", "_"):
+        up = up.replace(sep, " ")
+    tokens = [t.strip(",. ") for t in up.split() if t.strip(",. ")]
+
+    # Keep tokens that are exact categories
+    picked: list[str] = []
+    for tok in tokens:
+        if tok in allowed and tok not in picked:
+            picked.append(tok)
+
+    if not picked:
+        return None
+
+    # Stable, human-friendly order
+    order = ["AM", "A1", "A2", "A", "B1", "B", "BE", "C1", "C", "CE", "D1", "D", "DE"]
+    picked_sorted = [x for x in order if x in picked]
+    return ", ".join(picked_sorted) if picked_sorted else None
+
+
+def _postprocess_ai_result(data: dict) -> dict:
+    """
+    Make output more reliable:
+    - Enforce expected types/lengths
+    - Recompute years_of_experience from issue_date when possible
+    - Ensure approved matches the computed years when possible
+    """
+    issue = _parse_ddmmyyyy(data.get("issue_date"))
+    expiry = _parse_ddmmyyyy(data.get("expiry_date"))
+
+    # Normalize strings
+    data["holder_name"] = _cap_str(data.get("holder_name"))
+    data["family_name"] = _cap_str(data.get("family_name"))
+    data["given_name"] = _cap_str(data.get("given_name"))
+    data["birth_place"] = _cap_str(data.get("birth_place"))
+    data["licence_number"] = _cap_str(data.get("licence_number"))
+    data["licence_categories"] = _normalize_categories(_cap_str(data.get("licence_categories")))
+    data["reason"] = _cap_str(data.get("reason"), max_len=200) or "No reason provided."
+
+    birth = _parse_ddmmyyyy(data.get("birth_date"))
+    data["birth_date"] = birth.strftime("%d/%m/%Y") if birth else None
+
+    # Build/normalize holder_name for backward compatibility
+    if data.get("given_name") or data.get("family_name"):
+        full = " ".join([x for x in [data.get("given_name"), data.get("family_name")] if x])
+        data["holder_name"] = _cap_str(full)
+
+    # If categories looks like it duplicated another field, drop it.
+    if data.get("licence_categories") and (
+        data["licence_categories"] == data.get("licence_number")
+        or data["licence_categories"] == data.get("holder_name")
+    ):
+        data["licence_categories"] = None
+
+    # Normalize dates to dd/mm/yyyy or null
+    data["issue_date"] = issue.strftime("%d/%m/%Y") if issue else None
+    data["expiry_date"] = expiry.strftime("%d/%m/%Y") if expiry else None
+
+    # Recompute years if we have issue date
+    if issue:
+        today = date.today()
+        # If issue date is in the future, treat as invalid
+        if issue > today:
+            data["years_of_experience"] = 0.0
+            data["approved"] = False
+            data["reason"] = "Issue date is in the future; manual review required."
+            return data
+
+        years = (today - issue).days / 365.25
+        years = round(years, 1)
+        data["years_of_experience"] = years
+        data["approved"] = bool(years >= 2.0)
+
+    # Ensure years is numeric or null
+    y = data.get("years_of_experience")
+    if y is None:
+        pass
+    else:
+        try:
+            data["years_of_experience"] = float(y)
+        except Exception:
+            data["years_of_experience"] = None
+
+    # Ensure approved is boolean
+    data["approved"] = bool(data.get("approved"))
+    return data
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    """
+    Extract the first complete JSON object from text using a simple brace scanner
+    that is aware of JSON strings and escapes.
+    """
+    if not text or not isinstance(text, str):
+        return None
+
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    in_str = False
+    escape = False
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "\"":
+                in_str = False
+        else:
+            if ch == "\"":
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Helper – call Gemini with the image
 # ---------------------------------------------------------------------------
 async def analyse_licence(image_bytes: bytes, content_type: str) -> dict:
-    """Send the licence image to Gemini and parse the structured response."""
-    from google.api_core import exceptions as google_exceptions
+    """Send the licence image to Cloudflare Workers AI and parse the structured response."""
+    import httpx
     from PIL import Image
 
     try:
@@ -133,18 +307,92 @@ async def analyse_licence(image_bytes: bytes, content_type: str) -> dict:
     today_str = date.today().strftime("%d/%m/%Y")
     prompt = VALIDATION_PROMPT.replace("{today}", today_str)
 
-    logger.info("Sending image to Gemini for analysis …")
-    try:
-        response = _get_gemini_model().generate_content([prompt, image])
-    except google_exceptions.ResourceExhausted as e:
-        logger.warning("Gemini quota exceeded: %s", e)
-        raise HTTPException(
-            status_code=429,
-            detail="Gemini API quota exceeded. Try again later or check your plan at https://ai.google.dev/gemini-api/docs/rate-limits",
-        ) from e
+    if not _cloudflare_configured():
+        raise HTTPException(status_code=503, detail="Cloudflare Workers AI is not configured on the server")
 
-    raw_text = response.text.strip()
-    logger.info("Gemini raw response: %s", raw_text)
+    # Ensure the image is safely representable as bytes for Workers AI input.
+    # We'll send a compact list of uint8 ints (matches the common Workers AI schema for images).
+    ocr_text = ""
+    normalized_bytes = image_bytes
+    try:
+        image = image.convert("RGB")
+
+        # OCR pass to reduce hallucinations on IDs/dates.
+        try:
+            import pytesseract
+
+            # Resize a bit to improve OCR for small text.
+            w, h = image.size
+            scale = 2 if max(w, h) < 1400 else 1
+            if scale != 1:
+                image_for_ocr = image.resize((w * scale, h * scale))
+            else:
+                image_for_ocr = image
+
+            ocr_text = pytesseract.image_to_string(image_for_ocr) or ""
+            ocr_text = ocr_text.strip()
+        except Exception:
+            ocr_text = ""
+
+        # Normalize image bytes (keeps payload consistent)
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=92)
+        normalized_bytes = buf.getvalue()
+    except Exception:
+        ocr_text = ""
+        normalized_bytes = image_bytes
+
+    headers = {
+        "Authorization": f"Bearer {os.getenv('CF_API_TOKEN')}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "prompt": (prompt + ("\n\nOCR_TEXT:\n" + ocr_text if ocr_text else "")),
+        "image": list(normalized_bytes),
+        "max_tokens": 1024,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "repetition_penalty": 1.15,
+        "frequency_penalty": 0.2,
+    }
+
+    logger.info("Sending image to Cloudflare Workers AI for analysis …")
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(_cloudflare_ai_url(), headers=headers, json=payload)
+    except httpx.TimeoutException as e:
+        raise HTTPException(status_code=504, detail="Cloudflare AI request timed out") from e
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail="Cloudflare AI request failed") from e
+
+    if resp.status_code == 429:
+        raise HTTPException(status_code=429, detail="Cloudflare AI rate limit exceeded. Try again later.")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Cloudflare AI error ({resp.status_code}): {resp.text}")
+
+    try:
+        cf = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail="Cloudflare AI returned non-JSON response") from e
+
+    # Workers AI typically returns:
+    # { "success": true, "result": { "response": "..." } }
+    # Some models may return { "result": { "description": "..." } } etc.
+    result = (cf or {}).get("result") if isinstance(cf, dict) else None
+    raw_text = ""
+    if isinstance(result, dict):
+        raw_text = (
+            result.get("response")
+            or result.get("text")
+            or result.get("output")
+            or result.get("description")
+            or ""
+        )
+    if not isinstance(raw_text, str):
+        raw_text = str(raw_text)
+    raw_text = raw_text.strip()
+
+    logger.info("Cloudflare AI raw response: %s", raw_text)
 
     # Try to parse the JSON response from Gemini
     import json
@@ -156,6 +404,13 @@ async def analyse_licence(image_bytes: bytes, content_type: str) -> dict:
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
     cleaned = cleaned.strip()
+    cleaned = cleaned.replace("\\_", "_")
+    while cleaned.startswith("{{") and cleaned.endswith("}}"):
+        cleaned = cleaned[1:-1].strip()
+
+    extracted = _extract_first_json_object(cleaned)
+    if extracted:
+        cleaned = extracted
 
     try:
         data = json.loads(cleaned)
@@ -164,6 +419,10 @@ async def analyse_licence(image_bytes: bytes, content_type: str) -> dict:
         return {
             "approved": False,
             "years_of_experience": None,
+            "family_name": None,
+            "given_name": None,
+            "birth_date": None,
+            "birth_place": None,
             "issue_date": None,
             "expiry_date": None,
             "licence_number": None,
@@ -174,7 +433,7 @@ async def analyse_licence(image_bytes: bytes, content_type: str) -> dict:
         }
 
     data["raw_ai_response"] = raw_text
-    return data
+    return _postprocess_ai_result(data)
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +461,7 @@ async def health():
         status="healthy",
         service="driving-licence-validator",
         timestamp=datetime.utcnow().isoformat(),
-        gemini_configured=bool(os.getenv("GEMINI_API_KEY")),
+            cloudflare_configured=_cloudflare_configured(),
     )
 
 
