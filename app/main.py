@@ -498,6 +498,16 @@ async def validate_licence(file: UploadFile = File(...)):
     return ValidationResult(**result)
 
 
+@fastapi_app.get("/validate")
+async def validate_licence_help():
+    """Friendly help for browser visits to /validate."""
+    return {
+        "message": "Use POST /validate with multipart form-data field 'file'.",
+        "example_curl": "curl -X POST https://<your-domain>/validate -F \"file=@/path/to/licence.jpg\"",
+        "swagger_docs": "/docs",
+    }
+
+
 @fastapi_app.post("/validate-base64", response_model=ValidationResult)
 async def validate_licence_base64(payload: dict):
     """
